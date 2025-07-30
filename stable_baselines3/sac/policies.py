@@ -4,7 +4,7 @@ import torch as th
 from gymnasium import spaces
 from torch import nn
 
-from stable_baselines3.common.distributions import SquashedDiagGaussianDistribution, StateDependentNoiseDistribution
+from stable_baselines3.common.distributions import SquashedDiagGaussianDistribution, DiagGaussianDistribution, StateDependentNoiseDistribution
 from stable_baselines3.common.policies import BasePolicy, ContinuousCritic
 from stable_baselines3.common.preprocessing import get_action_dim
 from stable_baselines3.common.torch_layers import (
@@ -61,6 +61,8 @@ class Actor(BasePolicy):
         use_expln: bool = False,
         clip_mean: float = 2.0,
         normalize_images: bool = True,
+        post_linear_modules: Optional[list[type[nn.Module]]] = None,
+        standard_gauss_init: bool = False,
     ):
         super().__init__(
             observation_space,
@@ -80,9 +82,10 @@ class Actor(BasePolicy):
         self.use_expln = use_expln
         self.full_std = full_std
         self.clip_mean = clip_mean
+        self.standard_gauss_init = standard_gauss_init
 
         action_dim = get_action_dim(self.action_space)
-        latent_pi_net = create_mlp(features_dim, -1, net_arch, activation_fn)
+        latent_pi_net = create_mlp(features_dim, -1, net_arch, activation_fn, post_linear_modules=post_linear_modules)
         self.latent_pi = nn.Sequential(*latent_pi_net)
         last_layer_dim = net_arch[-1] if len(net_arch) > 0 else features_dim
 
@@ -98,9 +101,18 @@ class Actor(BasePolicy):
             if clip_mean > 0.0:
                 self.mu = nn.Sequential(self.mu, nn.Hardtanh(min_val=-clip_mean, max_val=clip_mean))
         else:
-            self.action_dist = SquashedDiagGaussianDistribution(action_dim)  # type: ignore[assignment]
-            self.mu = nn.Linear(last_layer_dim, action_dim)
-            self.log_std = nn.Linear(last_layer_dim, action_dim)  # type: ignore[assignment]
+            if standard_gauss_init:
+                self.action_dist = SquashedDiagGaussianDistribution(action_dim)  # type: ignore[assignment]
+                self.mu = nn.Linear(last_layer_dim, action_dim)
+                nn.init.zeros_(self.mu.weight)
+                nn.init.zeros_(self.mu.bias)
+                self.log_std = nn.Linear(last_layer_dim, action_dim)  # type: ignore[assignment]
+                nn.init.zeros_(self.log_std.weight)
+                nn.init.zeros_(self.log_std.bias)
+            else:
+                self.action_dist = SquashedDiagGaussianDistribution(action_dim)  # type: ignore[assignment]
+                self.mu = nn.Linear(last_layer_dim, action_dim)
+                self.log_std = nn.Linear(last_layer_dim, action_dim)  # type: ignore[assignment]
 
     def _get_constructor_parameters(self) -> dict[str, Any]:
         data = super()._get_constructor_parameters()
@@ -161,7 +173,8 @@ class Actor(BasePolicy):
         # Unstructured exploration (Original implementation)
         log_std = self.log_std(latent_pi)  # type: ignore[operator]
         # Original Implementation to cap the standard deviation
-        log_std = th.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        if not self.standard_gauss_init:
+            log_std = th.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
         return mean_actions, log_std, {}
 
     def forward(self, obs: PyTorchObs, deterministic: bool = False) -> th.Tensor:
@@ -229,6 +242,8 @@ class SACPolicy(BasePolicy):
         optimizer_kwargs: Optional[dict[str, Any]] = None,
         n_critics: int = 2,
         share_features_extractor: bool = False,
+        post_linear_modules: Optional[list[type[nn.Module]]] = None,
+        standard_gauss_init: bool = False,
     ):
         super().__init__(
             observation_space,
@@ -254,6 +269,7 @@ class SACPolicy(BasePolicy):
             "net_arch": actor_arch,
             "activation_fn": self.activation_fn,
             "normalize_images": normalize_images,
+            "post_linear_modules": post_linear_modules,
         }
         self.actor_kwargs = self.net_args.copy()
 
@@ -262,6 +278,7 @@ class SACPolicy(BasePolicy):
             "log_std_init": log_std_init,
             "use_expln": use_expln,
             "clip_mean": clip_mean,
+            "standard_gauss_init": standard_gauss_init,
         }
         self.actor_kwargs.update(sde_kwargs)
         self.critic_kwargs = self.net_args.copy()

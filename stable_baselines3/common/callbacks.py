@@ -113,6 +113,13 @@ class BaseCallback(ABC):
 
         return self._on_step()
 
+    # @abstractmethod
+    def _on_init_train_step(self) -> None:
+        pass
+
+    def on_init_train_step(self) -> None:
+        self._on_init_train_step()
+
     def on_training_end(self) -> None:
         self._on_training_end()
 
@@ -230,6 +237,10 @@ class CallbackList(BaseCallback):
     def _on_training_end(self) -> None:
         for callback in self.callbacks:
             callback.on_training_end()
+
+    def _on_init_train_step(self) -> None:
+        for callback in self.callbacks:
+            callback.on_init_train_step()
 
     def update_child_locals(self, locals_: dict[str, Any]) -> None:
         """

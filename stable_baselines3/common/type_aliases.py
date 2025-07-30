@@ -52,8 +52,6 @@ class ReplayBufferSamples(NamedTuple):
     next_observations: th.Tensor
     dones: th.Tensor
     rewards: th.Tensor
-    # For n-step replay buffer
-    discounts: Optional[th.Tensor] = None
 
 
 class DictReplayBufferSamples(NamedTuple):
@@ -62,7 +60,6 @@ class DictReplayBufferSamples(NamedTuple):
     next_observations: TensorDict
     dones: th.Tensor
     rewards: th.Tensor
-    discounts: Optional[th.Tensor] = None
 
 
 class RolloutReturn(NamedTuple):

@@ -180,6 +180,7 @@ def create_mlp(
         modules.append(nn.Linear(last_layer_dim, output_dim, bias=with_bias))
     if squash_output:
         modules.append(nn.Tanh())
+
     return modules
 
 
