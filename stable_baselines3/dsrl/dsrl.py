@@ -17,22 +17,14 @@ from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Rollout
 from stable_baselines3.common.utils import safe_mean, should_collect_more_steps
 from stable_baselines3.common.vec_env import VecEnv
 
-SelfSAC = TypeVar("SelfSAC", bound="SAC")
+SelfDSRL = TypeVar("SelfDSRL", bound="DSRL")
 
 
-class SACDiffusionNoise(OffPolicyAlgorithm):
+class DSRL(OffPolicyAlgorithm):
 	"""
-	Soft Actor-Critic (SAC)
-	Off-Policy Maximum Entropy Deep Reinforcement Learning with a Stochastic Actor,
-	This implementation borrows code from original implementation (https://github.com/haarnoja/sac)
-	from OpenAI Spinning Up (https://github.com/openai/spinningup), from the softlearning repo
-	(https://github.com/rail-berkeley/softlearning/)
-	and from Stable Baselines (https://github.com/hill-a/stable-baselines)
-	Paper: https://arxiv.org/abs/1801.01290
-	Introduction to SAC: https://spinningup.openai.com/en/latest/algorithms/sac.html
-
-	Note: we use double q target and not value target as discussed
-	in https://github.com/hill-a/stable-baselines/issues/270
+	DSRL-NA (noise aliased variant of DSRL)
+	Based on the SAC implementation in Stable Baselines3.
+	Paper: https://arxiv.org/pdf/2506.15799
 
 	:param policy: The policy model to use (MlpPolicy, CnnPolicy, ...)
 	:param env: The environment to learn from (if registered in Gym, can be str)
@@ -79,8 +71,12 @@ class SACDiffusionNoise(OffPolicyAlgorithm):
 	:param device: Device (cpu, cuda, ...) on which the code should be run.
 		Setting it to auto, the code will be run on the GPU if possible.
 	:param _init_setup_model: Whether or not to build the network at the creation of the instance
+	:param actor_gradient_steps: Number of gradient steps to take on actor per training update
+	:param diffusion_policy: The diffusion policy to use for action generation
+	:param diffusion_act_dim: The action dimension for the diffusion policy (tuple of (action chunk length, action_dim))
+	:param noise_critic_grad_steps: Number of gradient steps to take on distilled noise critic per training update
+	:param critic_backup_combine_type: How to combine the critics for the backup (min or mean)
 	"""
-
 	policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
 		"MlpPolicy": MlpPolicy,
 		"CnnPolicy": CnnPolicy,
@@ -124,8 +120,8 @@ class SACDiffusionNoise(OffPolicyAlgorithm):
 		actor_gradient_steps: int = -1,
 		diffusion_policy=None,
 		diffusion_act_dim=None,
-		diffusion_critic_grad_steps: int = 1,
-		critic_backup_combine_type='min'
+		noise_critic_grad_steps: int = 1,
+		critic_backup_combine_type='min',
 	):
 		super().__init__(
 			policy,
@@ -167,7 +163,7 @@ class SACDiffusionNoise(OffPolicyAlgorithm):
 		self.diffusion_policy = diffusion_policy
 		self.diffusion_act_chunk = diffusion_act_dim[0]
 		self.diffusion_act_dim = diffusion_act_dim[1]
-		self.diffusion_critic_grad_steps = diffusion_critic_grad_steps
+		self.noise_critic_grad_steps = noise_critic_grad_steps
 		self.critic_backup_combine_type = critic_backup_combine_type
 
 		if _init_setup_model:
@@ -278,9 +274,7 @@ class SACDiffusionNoise(OffPolicyAlgorithm):
 				# Select action according to policy
 				next_actions, next_log_prob = self.actor.action_log_prob(replay_data.next_observations)
 				next_actions = th.tensor(self.policy.unscale_action(next_actions.cpu().numpy())).to(self.device)
-				cond = {"state": replay_data.next_observations, "noise_action": next_actions.reshape(-1, self.diffusion_act_chunk, self.diffusion_act_dim)}
-				samples = self.diffusion_policy(cond=cond, deterministic=True)
-				next_actions = (samples.trajectories.detach())
+				next_actions = self.diffusion_policy(replay_data.next_observations, next_actions.reshape(-1, self.diffusion_act_chunk, self.diffusion_act_dim), return_numpy=False)
 				next_actions = next_actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
 				# Compute the next Q values: min over all critics targets
 				next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
@@ -330,7 +324,7 @@ class SACDiffusionNoise(OffPolicyAlgorithm):
 				# Copy running stats, see GH issue #996
 				polyak_update(self.batch_norm_stats, self.batch_norm_stats_target, 1.0)
 
-		for gradient_step in range(self.diffusion_critic_grad_steps):
+		for gradient_step in range(self.noise_critic_grad_steps):
 			# Sample replay buffer
 			critic_distill_loss = 0
 			replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
@@ -355,9 +349,7 @@ class SACDiffusionNoise(OffPolicyAlgorithm):
 	def update_noise_critic(self, replay_data):
 		with th.no_grad():
 			noise_actions = th.randn(replay_data.actions.shape[0], self.diffusion_act_chunk, self.diffusion_act_dim).to(self.device)
-			cond = {"state": replay_data.observations, "noise_action": noise_actions,}
-			samples = self.diffusion_policy(cond=cond, deterministic=True)
-			diffused_actions = (samples.trajectories.detach())
+			diffused_actions = self.diffusion_policy(replay_data.observations, noise_actions, return_numpy=False)
 			diffused_actions = diffused_actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
 			current_q_values = self.critic(replay_data.observations, diffused_actions)
 		noise_actions = noise_actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim).detach().cpu().numpy()
@@ -372,14 +364,14 @@ class SACDiffusionNoise(OffPolicyAlgorithm):
 
 
 	def learn(
-		self: SelfSAC,
+		self: SelfDSRL,
 		total_timesteps: int,
 		callback: MaybeCallback = None,
 		log_interval: int = 4,
 		tb_log_name: str = "SAC",
 		reset_num_timesteps: bool = True,
 		progress_bar: bool = False,
-	) -> SelfSAC:
+	) -> SelfDSRL:
 		return super().learn(
 			total_timesteps=total_timesteps,
 			callback=callback,
@@ -449,11 +441,9 @@ class SACDiffusionNoise(OffPolicyAlgorithm):
 			# Discrete case, no need to normalize or clip
 			buffer_action = unscaled_action
 			action = buffer_action
-		action = th.as_tensor(action, device=self.device)
-		obs = th.as_tensor(self._last_obs, device=self.device)
-		cond = {"state": obs, "noise_action": action.reshape(-1, self.diffusion_act_chunk, self.diffusion_act_dim)}
-		samples = self.diffusion_policy(cond=cond, deterministic=True)
-		action = (samples.trajectories.detach())
+		action = th.as_tensor(action, device=self.device, dtype=th.float32)
+		obs = th.as_tensor(self._last_obs, device=self.device, dtype=th.float32)
+		action = self.diffusion_policy(obs, action.reshape(-1, self.diffusion_act_chunk, self.diffusion_act_dim), return_numpy=False)
 		action = action.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
 		action = action.cpu().numpy()
 		buffer_action = action
@@ -476,11 +466,9 @@ class SACDiffusionNoise(OffPolicyAlgorithm):
 			# Discrete case, no need to normalize or clip
 			buffer_action = unscaled_action
 			action = buffer_action
-		action = th.as_tensor(action, device=self.device)
-		obs = th.as_tensor(observation, device=self.device)
-		cond = {"state": obs, "noise_action": action.reshape(-1, self.diffusion_act_chunk, self.diffusion_act_dim)}
-		samples = self.diffusion_policy(cond=cond, deterministic=True)
-		action = (samples.trajectories.detach())
+		action = th.as_tensor(action, device=self.device, dtype=th.float32)
+		obs = th.as_tensor(observation, device=self.device, dtype=th.float32)
+		action = self.diffusion_policy(obs, action.reshape(-1, self.diffusion_act_chunk, self.diffusion_act_dim), return_numpy=False)
 		action = action.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
 		action = action.cpu().numpy()
 		return action, predict_second_return
