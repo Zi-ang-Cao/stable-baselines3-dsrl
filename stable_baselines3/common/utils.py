@@ -415,6 +415,12 @@ def safe_mean(arr: Union[np.ndarray, list, deque]) -> float:
     :param arr: Numpy array or list of values
     :return:
     """
+
+    # When using robomimic env, the success is a dict of bools
+    if len(arr) > 0 and isinstance(arr[0], dict):
+        # We assume the success is the first value of the dict
+        arr = [list(item.values())[0] for item in arr if item]
+    
     return np.nan if len(arr) == 0 else float(np.mean(arr))  # type: ignore[arg-type]
 
 
